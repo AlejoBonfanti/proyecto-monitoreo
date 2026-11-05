@@ -1,0 +1,486 @@
+--- a/src/mocks/datos.ts
++++ b/src/mocks/datos.ts
+@@ -13,11 +13,14 @@
+ import type { Metrica } from "@/features/metricas/types";
+ import { hoyISO, sumarDias } from "@/lib/fechas";
+ 
+-export interface GranjaRow { id: number; nombre: string; ubicacion: string }
++/** `activo`: baja = desactivar, nunca se borra (decisión #35). */
++export interface GranjaRow { id: number; nombre: string; ubicacion: string | null; activo: boolean }
+ export interface GalponRow {
+   id: number; granjaId: number; nombre: string; estadoOperativo: EstadoOperativo;
+   /** Solo en limpieza (mismo CHECK que la base). */
+   fechaInicioLimpieza: string | null; fechaFinLimpiezaEstimada: string | null;
++  /** Baja = desactivar (decisión #35). Un galpón inactivo no aparece en `/galpones`. */
++  activo: boolean;
+ }
+ export interface UsuarioRow {
+   id: number; nombre: string; email: string; password: string; rol: Rol; activo: boolean;
+@@ -55,7 +58,7 @@
+   alertas: AlertaRow[];
+   lecturasActuales: LecturaRow[];
+   nodos: NodoRow[];
+-  secuencias: { lote: number; usuario: number };
++  secuencias: { lote: number; usuario: number; granja: number; galpon: number };
+ }
+ 
+ /** Contraseña de todos los usuarios de demo. Solo existe en los mocks. */
+@@ -77,10 +80,10 @@
+   const sinAtencion = { fechaReconocimiento: null, fechaEscalada: null, fechaResolucion: null, reconocidaPor: null, resueltaPor: null, resolucionAutomatica: false };
+ 
+   return {
+-    granjas: [{ id: 1, nombre: "Granja Esperanza", ubicacion: "Esperanza, Santa Fe" }],
++    granjas: [{ id: 1, nombre: "Granja Esperanza", ubicacion: "Esperanza, Santa Fe", activo: true }],
+     galpones: [
+-      { id: 1, granjaId: 1, nombre: "Galpón 1", estadoOperativo: "produccion", fechaInicioLimpieza: null, fechaFinLimpiezaEstimada: null },
+-      { id: 2, granjaId: 1, nombre: "Galpón 2", estadoOperativo: "limpieza", fechaInicioLimpieza: inicioLimpieza, fechaFinLimpiezaEstimada: sumarDias(inicioLimpieza, DIAS_LIMPIEZA_ESTIMADOS) },
++      { id: 1, granjaId: 1, nombre: "Galpón 1", estadoOperativo: "produccion", fechaInicioLimpieza: null, fechaFinLimpiezaEstimada: null, activo: true },
++      { id: 2, granjaId: 1, nombre: "Galpón 2", estadoOperativo: "limpieza", fechaInicioLimpieza: inicioLimpieza, fechaFinLimpiezaEstimada: sumarDias(inicioLimpieza, DIAS_LIMPIEZA_ESTIMADOS), activo: true },
+     ],
+     usuarios: [
+       { id: 1, nombre: "Administrador Carnave", email: "admin@carnave.com", password: PASSWORD_DEMO, rol: "admin", activo: true, telefono: null },
+@@ -127,6 +130,6 @@
+       { id: 1, galponId: 1, identificador: "AA:BB:CC:00:00:01", ultimaConexion: haceMin(1), activo: true },
+       { id: 2, galponId: 2, identificador: "AA:BB:CC:00:00:02", ultimaConexion: haceMin(4), activo: true },
+     ],
+-    secuencias: { lote: 14, usuario: 3 },
++    secuencias: { lote: 14, usuario: 3, granja: 2, galpon: 3 },
+   };
+ }
+--- a/src/mocks/api.ts
++++ b/src/mocks/api.ts
+@@ -7,11 +7,12 @@
+ import type { Alerta } from "@/features/alertas/types";
+ import type { LoginRespuesta, Usuario } from "@/features/auth/types";
+ import type { Galpon, LecturaActual, SerieLecturas } from "@/features/galpones/types";
++import type { CambiosGalpon, CambiosGranja, GranjaAdmin, NuevaGranja } from "@/features/granjas/types";
+ import type { Lote } from "@/features/lotes/types";
+ import type { CambiosUsuario, NuevoUsuario, UsuarioAdmin } from "@/features/usuarios/types";
+ import { METRICAS, type Metrica, type Umbrales } from "@/features/metricas/types";
+ import { ahora as reloj, hoyISO, sumarDias } from "@/lib/fechas";
+-import { DIAS_LIMPIEZA_ESTIMADOS, type AlertaRow, type GalponRow, type LoteRow, type MockDb, type UsuarioRow } from "./datos";
++import { DIAS_LIMPIEZA_ESTIMADOS, type AlertaRow, type GalponRow, type GranjaRow, type LoteRow, type MockDb, type UsuarioRow } from "./datos";
+ import { db } from "./db";
+ import { generarSerie } from "./lecturas";
+ import { edadDias, estadoNodo, evaluarSeveridad, reglaVigente, umbralesDe } from "./motor";
+@@ -43,7 +44,16 @@
+ 
+ // ---------- Permisos ----------
+ 
++/** Galpones activos que el usuario puede ver. Los dados de baja no aparecen (decisión #35). */
+ function galponesVisibles(d: MockDb, u: UsuarioRow): GalponRow[] {
++  return galponesConHistorial(d, u).filter((g) => g.activo);
++}
++
++/**
++ * Incluye los dados de baja: sus alertas (ya resueltas) siguen en `/alertas` para el admin.
++ * Al encargado la baja le quita la asignación, así que deja de verlos.
++ */
++function galponesConHistorial(d: MockDb, u: UsuarioRow): GalponRow[] {
+   if (u.rol === "admin") return d.galpones;
+   const ids = new Set(d.usuarioGalpon.filter((ug) => ug.usuarioId === u.id).map((ug) => ug.galponId));
+   return d.galpones.filter((g) => ids.has(g.id));
+@@ -222,7 +232,7 @@
+ 
+ const listarAlertas: Handler = ({ usuario, query }) => {
+   const d = db();
+-  const visibles = new Set(galponesVisibles(d, usuario!).map((g) => g.id));
++  const visibles = new Set(galponesConHistorial(d, usuario!).map((g) => g.id));
+   const estado = query.get("estado"); // "abierta" | "resuelta"
+   const galponId = query.get("galponId");
+   const alertas = d.alertas
+@@ -258,8 +268,8 @@
+ const TELEFONO_E164 = /^\+[1-9]\d{7,14}$/;
+ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+ 
+-function soloAdmin(u: UsuarioRow | null): Response | null {
+-  return u?.rol === "admin" ? null : error(403, "Solo un administrador puede gestionar usuarios.");
++function soloAdmin(u: UsuarioRow | null, que: "usuarios" | "granjas" = "usuarios"): Response | null {
++  return u?.rol === "admin" ? null : error(403, `Solo un administrador puede gestionar ${que}.`);
+ }
+ 
+ function aUsuarioAdmin(d: MockDb, u: UsuarioRow): UsuarioAdmin {
+@@ -282,7 +292,8 @@
+   if (b.rol !== undefined && b.rol !== "admin" && b.rol !== "encargado") return "Rol inválido.";
+   if (b.password !== undefined && b.password.length < 8) return "La contraseña necesita al menos 8 caracteres.";
+   if (b.telefono !== undefined && b.telefono !== null && !TELEFONO_E164.test(b.telefono)) return "Teléfono inválido (formato +549…).";
+-  if (b.galponIds !== undefined && b.galponIds.some((id) => !d.galpones.some((g) => g.id === id))) return "Galpón inexistente.";
++  if (b.galponIds !== undefined && b.galponIds.some((id) => !d.galpones.some((g) => g.id === id && g.activo)))
++    return "Galpón inexistente o dado de baja.";
+   return null;
+ }
+ 
+@@ -358,6 +369,139 @@
+   return json(aUsuarioAdmin(d, u));
+ };
+ 
++// ---------- Granjas y galpones (ABM, solo admin — decisión #35) ----------
++// Baja = desactivar, nunca borrar. Mismas reglas que los triggers de docs/sql/001_esquema.sql.
++
++const porNombre = (a: { nombre: string }, b: { nombre: string }) => a.nombre.localeCompare(b.nombre, "es", { numeric: true });
++const mismoNombre = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
++
++function aGranjaAdmin(d: MockDb, gr: GranjaRow): GranjaAdmin {
++  const galpones = d.galpones
++    .filter((g) => g.granjaId === gr.id)
++    .sort((a, b) => Number(b.activo) - Number(a.activo) || porNombre(a, b))
++    .map((g) => ({ id: g.id, nombre: g.nombre, estadoOperativo: g.estadoOperativo, activo: g.activo }));
++  return { id: gr.id, nombre: gr.nombre, ubicacion: gr.ubicacion, activo: gr.activo, galpones };
++}
++
++/** Nombre vacío → 400; repetido entre las granjas activas (sin mayúsculas) → 409. */
++function validarNombreGranja(d: MockDb, nombre: string, idActual: number | null): Response | null {
++  if (!nombre.trim()) return error(400, "El nombre de la granja es obligatorio.");
++  if (d.granjas.some((g) => g.id !== idActual && g.activo && mismoNombre(g.nombre, nombre)))
++    return error(409, "Ya existe una granja activa con ese nombre.");
++  return null;
++}
++
++/** Nombre vacío → 400; repetido entre los galpones activos de la granja (sin mayúsculas) → 409. */
++function validarNombreGalpon(d: MockDb, granjaId: number, nombre: string, idActual: number | null): Response | null {
++  if (!nombre.trim()) return error(400, "El nombre del galpón es obligatorio.");
++  if (d.galpones.some((g) => g.id !== idActual && g.granjaId === granjaId && g.activo && mismoNombre(g.nombre, nombre)))
++    return error(409, "Ya existe un galpón activo con ese nombre en esta granja.");
++  return null;
++}
++
++const listarGranjas: Handler = ({ usuario }) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const orden = [...d.granjas].sort((a, b) => Number(b.activo) - Number(a.activo) || porNombre(a, b));
++  return json(orden.map((g) => aGranjaAdmin(d, g)));
++};
++
++const obtenerGranja: Handler = ({ usuario }, [id]) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const g = d.granjas.find((x) => x.id === Number(id));
++  return g ? json(aGranjaAdmin(d, g)) : error(404, "Granja no encontrada.");
++};
++
++const crearGranja: Handler = ({ usuario, body }) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const b = (body ?? {}) as Partial<NuevaGranja>;
++  const invalido = validarNombreGranja(d, b.nombre ?? "", null);
++  if (invalido) return invalido;
++  const nueva: GranjaRow = { id: d.secuencias.granja++, nombre: b.nombre!.trim(), ubicacion: b.ubicacion?.trim() || null, activo: true };
++  d.granjas.push(nueva);
++  return json(aGranjaAdmin(d, nueva), 201);
++};
++
++const actualizarGranja: Handler = ({ usuario, body }, [id]) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const g = d.granjas.find((x) => x.id === Number(id));
++  if (!g) return error(404, "Granja no encontrada.");
++  const b = (body ?? {}) as CambiosGranja;
++  const activo = b.activo ?? g.activo;
++  // Se valida el nombre final contra las activas (también al reactivar).
++  if (b.nombre !== undefined || (activo && !g.activo)) {
++    const invalido = validarNombreGranja(d, b.nombre ?? g.nombre, g.id);
++    if (invalido) return invalido;
++  }
++  if (g.activo && !activo && d.galpones.some((x) => x.granjaId === g.id && x.activo))
++    return error(409, "La granja tiene galpones activos: dalos de baja primero.");
++  if (b.nombre !== undefined) g.nombre = b.nombre.trim();
++  if (b.ubicacion !== undefined) g.ubicacion = b.ubicacion?.trim() || null;
++  g.activo = activo;
++  return json(aGranjaAdmin(d, g));
++};
++
++const crearGalponEnGranja: Handler = ({ usuario, body }, [id]) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const granja = d.granjas.find((x) => x.id === Number(id));
++  if (!granja) return error(404, "Granja no encontrada.");
++  if (!granja.activo) return error(409, "La granja está dada de baja.");
++  const { nombre = "" } = (body ?? {}) as { nombre?: string };
++  const invalido = validarNombreGalpon(d, granja.id, nombre, null);
++  if (invalido) return invalido;
++  const nuevo: GalponRow = {
++    id: d.secuencias.galpon++, granjaId: granja.id, nombre: nombre.trim(), estadoOperativo: "disponible",
++    fechaInicioLimpieza: null, fechaFinLimpiezaEstimada: null, activo: true,
++  };
++  d.galpones.push(nuevo);
++  return json({ id: nuevo.id, nombre: nuevo.nombre, estadoOperativo: nuevo.estadoOperativo, activo: nuevo.activo }, 201);
++};
++
++/** Efectos de la baja (en la base los hace el trigger `galpon_despues_baja`). */
++function darDeBajaGalpon(d: MockDb, g: GalponRow, ahora: Date) {
++  g.activo = false;
++  for (const n of d.nodos) if (n.galponId === g.id) n.activo = false;
++  d.usuarioGalpon = d.usuarioGalpon.filter((ug) => ug.galponId !== g.id);
++  for (const a of d.alertas) {
++    if (a.galponId !== g.id || a.estado === "resuelta") continue;
++    a.estado = "resuelta";
++    a.fechaResolucion = ahora.toISOString();
++    a.resueltaPor = null;
++    a.resolucionAutomatica = true;
++  }
++}
++
++const actualizarGalpon: Handler = ({ usuario, body, ahora }, [id]) => {
++  const prohibido = soloAdmin(usuario, "granjas");
++  if (prohibido) return prohibido;
++  const d = db();
++  const g = d.galpones.find((x) => x.id === Number(id));
++  if (!g) return error(404, "Galpón no encontrado.");
++  const b = (body ?? {}) as CambiosGalpon;
++  const activo = b.activo ?? g.activo;
++  if (g.activo && !activo && g.estadoOperativo === "produccion")
++    return error(409, "No se puede dar de baja un galpón en producción: primero finalizá el lote.");
++  if (!g.activo && activo && !d.granjas.find((x) => x.id === g.granjaId)?.activo)
++    return error(409, "La granja está dada de baja: reactivala primero.");
++  if (b.nombre !== undefined || (activo && !g.activo)) {
++    const invalido = validarNombreGalpon(d, g.granjaId, b.nombre ?? g.nombre, g.id);
++    if (invalido) return invalido;
++  }
++  if (b.nombre !== undefined) g.nombre = b.nombre.trim();
++  if (g.activo && !activo) darDeBajaGalpon(d, g, ahora);
++  else g.activo = activo;
++  return json({ id: g.id, nombre: g.nombre, estadoOperativo: g.estadoOperativo, activo: g.activo });
++};
++
+ // ---------- Router ----------
+ 
+ const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+@@ -375,6 +519,12 @@
+   ["POST", /^\/usuarios$/, crearUsuario],
+   ["GET", /^\/usuarios\/(\d+)$/, obtenerUsuario],
+   ["PATCH", /^\/usuarios\/(\d+)$/, actualizarUsuario],
++  ["GET", /^\/granjas$/, listarGranjas],
++  ["POST", /^\/granjas$/, crearGranja],
++  ["GET", /^\/granjas\/(\d+)$/, obtenerGranja],
++  ["PATCH", /^\/granjas\/(\d+)$/, actualizarGranja],
++  ["POST", /^\/granjas\/(\d+)\/galpones$/, crearGalponEnGranja],
++  ["PATCH", /^\/galpones\/(\d+)$/, actualizarGalpon],
+   ["GET", /^\/alertas$/, listarAlertas],
+   ["PATCH", new RegExp(`^/alertas/(${UUID})/reconocer$`, "i"), transicionAlerta("reconocer")],
+   ["PATCH", new RegExp(`^/alertas/(${UUID})/resolver$`, "i"), transicionAlerta("resolver")],
+--- a/src/mocks/api.test.ts
++++ b/src/mocks/api.test.ts
+@@ -6,6 +6,7 @@
+ import type { Alerta } from "@/features/alertas/types";
+ import type { LoginRespuesta } from "@/features/auth/types";
+ import type { Galpon } from "@/features/galpones/types";
++import type { GalponAdmin, GranjaAdmin } from "@/features/granjas/types";
+ import type { Lote } from "@/features/lotes/types";
+ import type { UsuarioAdmin } from "@/features/usuarios/types";
+ import { mockFetch } from "./api";
+@@ -55,7 +56,7 @@
+ 
+ describe("permisos por rol", () => {
+   it("el encargado solo ve sus galpones asignados; el admin ve todos", async () => {
+-    db().galpones.push({ id: 3, granjaId: 1, nombre: "Galpón 3", estadoOperativo: "disponible", fechaInicioLimpieza: null, fechaFinLimpiezaEstimada: null });
++    db().galpones.push({ id: 3, granjaId: 1, nombre: "Galpón 3", estadoOperativo: "disponible", fechaInicioLimpieza: null, fechaFinLimpiezaEstimada: null, activo: true });
+     const encargado = await llamar<Galpon[]>("/galpones", { token: await tokenDe("encargado@carnave.com") });
+     const admin = await llamar<Galpon[]>("/galpones", { token: await tokenDe("admin@carnave.com") });
+     expect(encargado.data.map((g) => g.id)).toEqual([1, 2]);
+@@ -285,3 +286,111 @@
+     expect((await llamar("/usuarios/1", { method: "PATCH", body: { rol: "encargado" }, token })).status).toBe(200);
+   });
+ });
++
++describe("granjas y galpones (ABM, solo admin — decisión #35)", () => {
++  it("el encargado no puede ver ni gestionar granjas ni galpones (403)", async () => {
++    const token = await tokenDe("encargado@carnave.com");
++    expect((await llamar("/granjas", { token })).status).toBe(403);
++    expect((await llamar("/granjas", { method: "POST", body: { nombre: "X", ubicacion: null }, token })).status).toBe(403);
++    expect((await llamar("/granjas/1/galpones", { method: "POST", body: { nombre: "X" }, token })).status).toBe(403);
++    expect((await llamar("/galpones/2", { method: "PATCH", body: { activo: false }, token })).status).toBe(403);
++  });
++
++  it("lista las granjas con sus galpones", async () => {
++    const { data } = await llamar<GranjaAdmin[]>("/granjas", { token: await tokenDe("admin@carnave.com") });
++    expect(data).toEqual([{
++      id: 1, nombre: "Granja Esperanza", ubicacion: "Esperanza, Santa Fe", activo: true,
++      galpones: [
++        { id: 1, nombre: "Galpón 1", estadoOperativo: "produccion", activo: true },
++        { id: 2, nombre: "Galpón 2", estadoOperativo: "limpieza", activo: true },
++      ],
++    }]);
++  });
++
++  it("alta y edición de granja; nombre vacío → 400, repetido sin mayúsculas → 409", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    const r = await llamar<GranjaAdmin>("/granjas", { method: "POST", body: { nombre: "  Granja Norte ", ubicacion: "" }, token });
++    expect(r.status).toBe(201);
++    expect(r.data).toEqual({ id: 2, nombre: "Granja Norte", ubicacion: null, activo: true, galpones: [] });
++    expect((await llamar("/granjas", { method: "POST", body: { nombre: "   ", ubicacion: null }, token })).status).toBe(400);
++    expect((await llamar("/granjas", { method: "POST", body: { nombre: "granja norte", ubicacion: null }, token })).status).toBe(409);
++    const e = await llamar<GranjaAdmin>("/granjas/2", { method: "PATCH", body: { ubicacion: "Rafaela" }, token });
++    expect(e.data).toMatchObject({ nombre: "Granja Norte", ubicacion: "Rafaela" });
++    expect((await llamar("/granjas/2", { method: "PATCH", body: { nombre: "GRANJA ESPERANZA" }, token })).status).toBe(409);
++    expect((await llamar("/granjas/99", { token })).status).toBe(404);
++  });
++
++  it("alta de galpón: nace disponible, visible en el dashboard y asignable", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    const r = await llamar<GalponAdmin>("/granjas/1/galpones", { method: "POST", body: { nombre: " Galpón 3 " }, token });
++    expect(r.status).toBe(201);
++    expect(r.data).toEqual({ id: 3, nombre: "Galpón 3", estadoOperativo: "disponible", activo: true });
++    expect((await llamar<Galpon>("/galpones/3", { token })).data).toMatchObject({ estadoOperativo: "disponible", loteActivo: null });
++    expect((await llamar("/usuarios/2", { method: "PATCH", body: { galponIds: [1, 2, 3] }, token })).status).toBe(200);
++  });
++
++  it("nombre de galpón: vacío → 400; repetido en la misma granja → 409; en otra granja se puede", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    expect((await llamar("/granjas/1/galpones", { method: "POST", body: { nombre: "" }, token })).status).toBe(400);
++    expect((await llamar("/granjas/1/galpones", { method: "POST", body: { nombre: "galpón 1" }, token })).status).toBe(409);
++    expect((await llamar("/galpones/2", { method: "PATCH", body: { nombre: "GALPÓN 1" }, token })).status).toBe(409);
++    await llamar("/granjas", { method: "POST", body: { nombre: "Granja Norte", ubicacion: null }, token });
++    expect((await llamar("/granjas/2/galpones", { method: "POST", body: { nombre: "Galpón 1" }, token })).status).toBe(201);
++    expect((await llamar<GalponAdmin>("/galpones/2", { method: "PATCH", body: { nombre: "Galpón Sur" }, token })).data.nombre).toBe("Galpón Sur");
++  });
++
++  it("no se da de baja un galpón en producción (409)", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    expect((await llamar("/galpones/1", { method: "PATCH", body: { activo: false }, token })).status).toBe(409);
++    expect(db().galpones.find((g) => g.id === 1)?.activo).toBe(true);
++  });
++
++  it("baja de galpón: desaparece del dashboard, se desactiva el nodo, se quitan asignaciones y se resuelven sus alertas", async () => {
++    const admin = await tokenDe("admin@carnave.com");
++    const encargado = await tokenDe("encargado@carnave.com");
++    const abierta = db().alertas.find((a) => a.id === uuidDemo(5))!;
++    Object.assign(abierta, { estado: "activa", fechaResolucion: null, resolucionAutomatica: false });
++
++    const r = await llamar<GalponAdmin>("/galpones/2", { method: "PATCH", body: { activo: false }, token: admin });
++    expect(r.data).toMatchObject({ id: 2, activo: false, estadoOperativo: "limpieza" });
++
++    expect((await llamar<Galpon[]>("/galpones", { token: admin })).data.map((g) => g.id)).toEqual([1]);
++    expect((await llamar("/galpones/2", { token: admin })).status).toBe(404);
++    expect((await llamar<Galpon[]>("/galpones", { token: encargado })).data.map((g) => g.id)).toEqual([1]);
++    expect(db().nodos.find((n) => n.galponId === 2)?.activo).toBe(false);
++    expect(db().usuarioGalpon.some((ug) => ug.galponId === 2)).toBe(false);
++    expect(abierta).toMatchObject({ estado: "resuelta", resueltaPor: null, resolucionAutomatica: true, fechaResolucion: "2026-09-28T15:00:00.000Z" });
++    // El admin sigue viendo sus alertas (resueltas) en el historial.
++    const alertas = await llamar<Alerta[]>("/alertas?galponId=2", { token: admin });
++    expect(alertas.data.every((a) => a.estado === "resuelta")).toBe(true);
++    expect(alertas.data.length).toBeGreaterThan(0);
++    // No se puede asignar ni cargarle lotes; sigue en el listado de la granja, como inactivo.
++    expect((await llamar("/usuarios/2", { method: "PATCH", body: { galponIds: [2] }, token: admin })).status).toBe(400);
++    const granja = await llamar<GranjaAdmin>("/granjas/1", { token: admin });
++    expect(granja.data.galpones.map((g) => [g.id, g.activo])).toEqual([[1, true], [2, false]]);
++  });
++
++  it("el nombre de un galpón dado de baja queda libre; reactivarlo con el nombre ocupado → 409", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    await llamar("/galpones/2", { method: "PATCH", body: { activo: false }, token });
++    expect((await llamar("/granjas/1/galpones", { method: "POST", body: { nombre: "Galpón 2" }, token })).status).toBe(201);
++    expect((await llamar("/galpones/2", { method: "PATCH", body: { activo: true }, token })).status).toBe(409);
++    const r = await llamar<GalponAdmin>("/galpones/2", { method: "PATCH", body: { nombre: "Galpón 2 (viejo)", activo: true }, token });
++    expect(r.data).toMatchObject({ nombre: "Galpón 2 (viejo)", activo: true });
++  });
++
++  it("baja de granja solo sin galpones activos; con la granja inactiva no hay altas ni reactivaciones", async () => {
++    const token = await tokenDe("admin@carnave.com");
++    await llamar("/granjas", { method: "POST", body: { nombre: "Granja Norte", ubicacion: null }, token });
++    await llamar("/granjas/2/galpones", { method: "POST", body: { nombre: "Galpón A" }, token });
++    expect((await llamar("/granjas/2", { method: "PATCH", body: { activo: false }, token })).status).toBe(409);
++    await llamar("/galpones/3", { method: "PATCH", body: { activo: false }, token });
++    expect((await llamar<GranjaAdmin>("/granjas/2", { method: "PATCH", body: { activo: false }, token })).data.activo).toBe(false);
++    expect((await llamar("/granjas/2/galpones", { method: "POST", body: { nombre: "Galpón B" }, token })).status).toBe(409);
++    expect((await llamar("/galpones/3", { method: "PATCH", body: { activo: true }, token })).status).toBe(409);
++    // Activas primero en el listado.
++    expect((await llamar<GranjaAdmin[]>("/granjas", { token })).data.map((g) => g.id)).toEqual([1, 2]);
++    await llamar("/granjas/2", { method: "PATCH", body: { activo: true }, token });
++    expect((await llamar("/galpones/3", { method: "PATCH", body: { activo: true }, token })).status).toBe(200);
++  });
++});
+--- a/docs/sql/pruebas.sql
++++ b/docs/sql/pruebas.sql
+@@ -179,5 +179,48 @@
+ SELECT pg_temp.afirmar((SELECT count(*) FROM lectura) = 2, 'reenvío de lecturas idempotente');
+ SELECT pg_temp.afirmar((SELECT valor_prom FROM lectura_1h WHERE galpon_id = 1 AND metrica = 'co2') = 2100, 'lectura_1h en vivo (materialized_only = false)');
+ 
++-- #35 altas y bajas de granjas y galpones (baja = desactivar) ------------------
++INSERT INTO granja (id, nombre) VALUES (3, '  Granja Sur ');
++SELECT pg_temp.afirmar((SELECT nombre FROM granja WHERE id = 3) = 'Granja Sur', 'nombre de granja sin espacios de borde');
++SELECT pg_temp.espera_error($$INSERT INTO granja (nombre) VALUES ('granja sur')$$, '23505');  -- repetido sin mayúsculas
++SELECT pg_temp.espera_error($$INSERT INTO granja (nombre) VALUES ('   ')$$, '23514');
++SELECT pg_temp.espera_error($$INSERT INTO granja (nombre, activo) VALUES ('Otra', false)$$, 'CN400');
++INSERT INTO galpon (id, granja_id, nombre) VALUES (30, 3, 'Galpón A'), (31, 3, 'Galpón B');
++SELECT pg_temp.espera_error($$INSERT INTO galpon (granja_id, nombre) VALUES (3, ' galpón a ')$$, '23505');
++SELECT pg_temp.espera_error($$INSERT INTO galpon (granja_id, nombre, estado_operativo) VALUES (3, 'Galpón C', 'limpieza')$$, 'CN400');
++SELECT pg_temp.espera_error($$UPDATE galpon SET granja_id = 1 WHERE id = 30$$, 'CN400', 'no cambia de granja');
++INSERT INTO nodo (id, galpon_id, identificador) VALUES (30, 30, 'AA:BB:CC:00:00:30'), (31, 31, 'AA:BB:CC:00:00:31');
++INSERT INTO usuario_galpon VALUES (2, 30), (2, 31);
++INSERT INTO lote (id, galpon_id, fecha_inicio, fecha_fin_estimada, cantidad_aves_inicial) VALUES (300, 30, hoy_ar() - 5, hoy_ar() + 40, 1000);
++SELECT pg_temp.espera_error($$UPDATE galpon SET activo = false WHERE id = 30$$, 'CN409', 'producción');
++SELECT pg_temp.espera_error($$UPDATE granja SET activo = false WHERE id = 3$$, 'CN409', 'galpones activos');
++
++-- Baja de un galpón con alerta abierta: se desactiva el nodo, se quitan asignaciones y la alerta se resuelve sola.
++INSERT INTO alerta (id, tipo, galpon_id, nodo_id) VALUES ('00000000-0000-0000-0000-000000000031', 'nodo_caido', 31, 31);
++UPDATE galpon SET activo = false WHERE id = 31;
++SELECT pg_temp.afirmar(NOT (SELECT activo FROM nodo WHERE id = 31), 'baja de galpón desactiva su nodo');
++SELECT pg_temp.afirmar(NOT EXISTS (SELECT 1 FROM usuario_galpon WHERE galpon_id = 31), 'baja de galpón quita asignaciones');
++SELECT pg_temp.afirmar((SELECT estado = 'resuelta' AND resolucion_automatica AND resuelta_por IS NULL
++                          FROM alerta WHERE id = '00000000-0000-0000-0000-000000000031'), 'baja de galpón resuelve sus alertas abiertas');
++SELECT pg_temp.afirmar(EXISTS (SELECT 1 FROM alerta_historial WHERE alerta_id = '00000000-0000-0000-0000-000000000031'
++                                  AND evento = 'resuelta' AND usuario_id IS NULL), 'la resolución automática queda en el historial');
++SELECT pg_temp.espera_error($$INSERT INTO usuario_galpon VALUES (2, 31)$$, 'CN400', 'dado de baja');
++SELECT pg_temp.espera_error($$INSERT INTO lote (galpon_id, fecha_inicio, fecha_fin_estimada, cantidad_aves_inicial) VALUES (31, hoy_ar(), hoy_ar() + 45, 100)$$, 'CN409', 'dado de baja');
++
++-- El nombre de un galpón dado de baja queda libre; reactivarlo con el nombre ocupado falla.
++INSERT INTO galpon (id, granja_id, nombre) VALUES (32, 3, 'Galpón B');
++SELECT pg_temp.espera_error($$UPDATE galpon SET activo = true WHERE id = 31$$, '23505');
++
++-- Granja: se da de baja recién sin galpones activos; con la granja inactiva no hay altas ni reactivaciones.
++UPDATE lote SET estado = 'finalizado' WHERE id = 300;
++UPDATE galpon SET activo = false WHERE granja_id = 3 AND activo;
++SELECT pg_temp.afirmar((SELECT estado_operativo FROM galpon WHERE id = 30) = 'limpieza', 'un galpón dado de baja en limpieza queda en limpieza');
++UPDATE granja SET activo = false WHERE id = 3;
++SELECT pg_temp.espera_error($$INSERT INTO galpon (granja_id, nombre) VALUES (3, 'Galpón D')$$, 'CN409', 'dada de baja');
++SELECT pg_temp.espera_error($$UPDATE galpon SET activo = true WHERE id = 30$$, 'CN409', 'reactivala');
++UPDATE granja SET activo = true WHERE id = 3;
++UPDATE galpon SET activo = true WHERE id = 30;
++SELECT pg_temp.afirmar((SELECT activo FROM galpon WHERE id = 30), 'reactivación de galpón con la granja activa');
++
+ SELECT 'OK: todas las pruebas del esquema pasaron' AS resultado;
+ ROLLBACK;
+--- /dev/null
++++ b/src/features/granjas/types.ts
+@@ -0,0 +1,36 @@
++import type { EstadoOperativo } from "@/features/galpones/types";
++
++/** Galpón dentro de `GranjaAdmin` (solo admin). El estado lo manejan los lotes: acá no se edita. */
++export interface GalponAdmin {
++  id: number;
++  nombre: string;
++  estadoOperativo: EstadoOperativo;
++  /** Baja = desactivar (decisión #35): nunca se borra, lotes y alertas guardan la historia. */
++  activo: boolean;
++}
++
++/** `GET /api/v1/granjas` y `GET /api/v1/granjas/:id` (solo admin). */
++export interface GranjaAdmin {
++  id: number;
++  nombre: string;
++  ubicacion: string | null;
++  activo: boolean;
++  galpones: GalponAdmin[];
++}
++
++/** Body de `POST /api/v1/granjas`. */
++export interface NuevaGranja {
++  nombre: string;
++  ubicacion: string | null;
++}
++
++/** Body de `PATCH /api/v1/granjas/:id`: solo los campos que cambian. */
++export type CambiosGranja = Partial<NuevaGranja> & { activo?: boolean };
++
++/** Body de `POST /api/v1/granjas/:id/galpones`. Nace `disponible`. */
++export interface NuevoGalpon {
++  nombre: string;
++}
++
++/** Body de `PATCH /api/v1/galpones/:id`: solo nombre y baja/reactivación. */
++export type CambiosGalpon = Partial<NuevoGalpon> & { activo?: boolean };

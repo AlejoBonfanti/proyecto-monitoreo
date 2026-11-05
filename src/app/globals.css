@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+/* Paleta y tipografía del mockup MVP (mockups_mvp_galpon.html) */
+@theme {
+  --color-canvas: #f4f5f1;
+  --color-surface: #ffffff;
+  --color-surface-muted: #eceee9;
+  --color-ink: #1c231e;
+  --color-ink-muted: #5b6259;
+  --color-ink-faint: #8b9187;
+  --color-line: #dee1d8;
+  --color-accent: #2f6b4f;
+  --color-accent-hover: #265b42;
+  --color-accent-bg: #e4eee7;
+  --color-warn: #a8711f;
+  --color-warn-bg: #f7ecd8;
+  --color-danger: #a23b2e;
+  --color-danger-bg: #f6e1dd;
+
+  --font-sans: -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
